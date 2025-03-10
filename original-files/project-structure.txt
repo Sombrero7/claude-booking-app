@@ -1,0 +1,19 @@
+# Project Structure
+
+```
+booking-platform/
+├── package.json
+├── turbo.json
+├── apps/
+│   ├── frontend/             # Next.js React frontend
+│   ├── api-gateway/          # API Gateway service
+│   ├── user-service/         # User management microservice
+│   ├── event-service/        # Event and space management microservice
+│   ├── booking-service/      # Booking and requests microservice
+│   └── payment-service/      # Payment processing microservice
+└── packages/
+    ├── eslint-config/        # Shared ESLint configuration
+    ├── typescript-config/    # Shared TypeScript configuration
+    ├── database/             # Shared database models and utilities
+    └── utils/                # Shared utility functions
+```
