@@ -1,6 +1,6 @@
 module.exports = {
-    extends: [
-      "./react.js",
-      "next/core-web-vitals"
-    ]
-  };
+  extends: [
+    "./react.js",
+    "next/core-web-vitals"
+  ]
+};

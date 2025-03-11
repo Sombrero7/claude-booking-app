@@ -1,0 +1,296 @@
+import { Request, Response } from 'express';
+import { UserModel } from '@booking-platform/database';
+import { successResponse, errorResponse } from '@booking-platform/utils';
+import admin from 'firebase-admin';
+
+// Initialize Firebase Admin SDK
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL
+    })
+  });
+}
+
+export interface AuthRequest extends Request {
+  user?: admin.auth.DecodedIdToken;
+}
+
+/**
+ * Create a new user
+ */
+export const createUser = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { role, profile } = req.body;
+
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    // Check if user already exists
+    const existingUser = await UserModel.findOne({ firebaseId: req.user.uid });
+    if (existingUser) {
+      res.status(409).json(errorResponse('User already exists', 'USER_EXISTS'));
+      return;
+    }
+
+    // Create new user
+    const newUser = new UserModel({
+      firebaseId: req.user.uid,
+      email: req.user.email,
+      role: role || 'customer',
+      profile: {
+        name: profile.name || req.user.name || 'User',
+        bio: profile.bio || '',
+        avatar: profile.avatar || req.user.picture || '',
+        phone: profile.phone || ''
+      },
+      followers: [],
+      following: []
+    });
+
+    await newUser.save();
+    res.status(201).json(successResponse(newUser));
+  } catch (error: any) {
+    console.error('Create user error:', error);
+    res.status(500).json(errorResponse(error.message, 'USER_CREATE_ERROR'));
+  }
+};
+
+/**
+ * Get current user profile
+ */
+export const getCurrentUser = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    const user = await UserModel.findOne({ firebaseId: req.user.uid });
+    if (!user) {
+      res.status(404).json(errorResponse('User not found', 'USER_NOT_FOUND'));
+      return;
+    }
+
+    res.status(200).json(successResponse(user));
+  } catch (error: any) {
+    console.error('Get current user error:', error);
+    res.status(500).json(errorResponse(error.message, 'USER_FETCH_ERROR'));
+  }
+};
+
+/**
+ * Get user by ID
+ */
+export const getUserById = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const user = await UserModel.findOne({ firebaseId: id });
+
+    if (!user) {
+      res.status(404).json(errorResponse('User not found', 'USER_NOT_FOUND'));
+      return;
+    }
+
+    // Remove sensitive information
+    const userData = user.toObject();
+    delete userData.stripe;
+
+    res.status(200).json(successResponse(userData));
+  } catch (error: any) {
+    console.error('Get user by ID error:', error);
+    res.status(500).json(errorResponse(error.message, 'USER_FETCH_ERROR'));
+  }
+};
+
+/**
+ * Update user profile
+ */
+export const updateUser = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    const { profile } = req.body;
+    
+    const user = await UserModel.findOne({ firebaseId: req.user.uid });
+    if (!user) {
+      res.status(404).json(errorResponse('User not found', 'USER_NOT_FOUND'));
+      return;
+    }
+
+    // Update profile fields
+    if (profile) {
+      user.profile = {
+        ...user.profile,
+        ...profile
+      };
+    }
+
+    await user.save();
+    res.status(200).json(successResponse(user));
+  } catch (error: any) {
+    console.error('Update user error:', error);
+    res.status(500).json(errorResponse(error.message, 'USER_UPDATE_ERROR'));
+  }
+};
+
+/**
+ * Follow a user
+ */
+export const followUser = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    const { userId } = req.params;
+    
+    // Get current user
+    const currentUser = await UserModel.findOne({ firebaseId: req.user.uid });
+    if (!currentUser) {
+      res.status(404).json(errorResponse('User not found', 'USER_NOT_FOUND'));
+      return;
+    }
+
+    // Get user to follow
+    const userToFollow = await UserModel.findOne({ firebaseId: userId });
+    if (!userToFollow) {
+      res.status(404).json(errorResponse('User to follow not found', 'USER_NOT_FOUND'));
+      return;
+    }
+
+    // Check if already following
+    if (currentUser.following.includes(userId)) {
+      res.status(400).json(errorResponse('Already following this user', 'ALREADY_FOLLOWING'));
+      return;
+    }
+
+    // Update current user's following list
+    currentUser.following.push(userId);
+    await currentUser.save();
+
+    // Update followed user's followers list
+    userToFollow.followers.push(req.user.uid);
+    await userToFollow.save();
+
+    res.status(200).json(successResponse({ message: 'Successfully followed user' }));
+  } catch (error: any) {
+    console.error('Follow user error:', error);
+    res.status(500).json(errorResponse(error.message, 'FOLLOW_ERROR'));
+  }
+};
+
+/**
+ * Unfollow a user
+ */
+export const unfollowUser = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    const { userId } = req.params;
+    
+    // Get current user
+    const currentUser = await UserModel.findOne({ firebaseId: req.user.uid });
+    if (!currentUser) {
+      res.status(404).json(errorResponse('User not found', 'USER_NOT_FOUND'));
+      return;
+    }
+
+    // Get user to unfollow
+    const userToUnfollow = await UserModel.findOne({ firebaseId: userId });
+    if (!userToUnfollow) {
+      res.status(404).json(errorResponse('User to unfollow not found', 'USER_NOT_FOUND'));
+      return;
+    }
+
+    // Check if following
+    if (!currentUser.following.includes(userId)) {
+      res.status(400).json(errorResponse('Not following this user', 'NOT_FOLLOWING'));
+      return;
+    }
+
+    // Update current user's following list
+    currentUser.following = currentUser.following.filter(id => id !== userId);
+    await currentUser.save();
+
+    // Update unfollowed user's followers list
+    userToUnfollow.followers = userToUnfollow.followers.filter(id => id !== req.user?.uid);
+    await userToUnfollow.save();
+
+    res.status(200).json(successResponse({ message: 'Successfully unfollowed user' }));
+  } catch (error: any) {
+    console.error('Unfollow user error:', error);
+    res.status(500).json(errorResponse(error.message, 'UNFOLLOW_ERROR'));
+  }
+};
+
+/**
+ * Get user's followers
+ */
+export const getUserFollowers = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { userId } = req.params;
+    
+    const user = await UserModel.findOne({ firebaseId: userId });
+    if (!user) {
+      res.status(404).json(errorResponse('User not found', 'USER_NOT_FOUND'));
+      return;
+    }
+
+    // Get all followers
+    const followers = await UserModel.find({ firebaseId: { $in: user.followers } });
+    
+    // Remove sensitive information
+    const followersList = followers.map(follower => {
+      const followerData = follower.toObject();
+      delete followerData.stripe;
+      return followerData;
+    });
+
+    res.status(200).json(successResponse(followersList));
+  } catch (error: any) {
+    console.error('Get followers error:', error);
+    res.status(500).json(errorResponse(error.message, 'FOLLOWERS_FETCH_ERROR'));
+  }
+};
+
+/**
+ * Get user's following
+ */
+export const getUserFollowing = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { userId } = req.params;
+    
+    const user = await UserModel.findOne({ firebaseId: userId });
+    if (!user) {
+      res.status(404).json(errorResponse('User not found', 'USER_NOT_FOUND'));
+      return;
+    }
+
+    // Get all following
+    const following = await UserModel.find({ firebaseId: { $in: user.following } });
+    
+    // Remove sensitive information
+    const followingList = following.map(followed => {
+      const followedData = followed.toObject();
+      delete followedData.stripe;
+      return followedData;
+    });
+
+    res.status(200).json(successResponse(followingList));
+  } catch (error: any) {
+    console.error('Get following error:', error);
+    res.status(500).json(errorResponse(error.message, 'FOLLOWING_FETCH_ERROR'));
+  }
+};

@@ -1,0 +1,20 @@
+{
+  "name": "@booking-platform/database",
+  "version": "0.0.1",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "mongoose": "^7.3.0"
+  },
+  "devDependencies": {
+    "@booking-platform/typescript-config": "*",
+    "@types/node": "^18.16.16",
+    "typescript": "^5.1.3"
+  }
+}

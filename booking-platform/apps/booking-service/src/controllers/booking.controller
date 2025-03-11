@@ -1,0 +1,337 @@
+import { Request, Response } from 'express';
+import { BookingModel, EventModel } from '@booking-platform/database';
+import { successResponse, errorResponse } from '@booking-platform/utils';
+import axios from 'axios';
+import admin from 'firebase-admin';
+
+// Initialize Firebase Admin SDK
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL
+    })
+  });
+}
+
+export interface AuthRequest extends Request {
+  user?: admin.auth.DecodedIdToken;
+}
+
+/**
+ * Create a new booking for an event
+ */
+export const createBooking = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    const { eventId, eventDate, attendeesCount, specialRequirements } = req.body;
+
+    // Validate required fields
+    if (!eventId || !eventDate) {
+      res.status(400).json(errorResponse('Missing required fields', 'MISSING_FIELDS'));
+      return;
+    }
+
+    // Fetch event details to calculate total amount
+    const event = await EventModel.findById(eventId);
+    if (!event) {
+      res.status(404).json(errorResponse('Event not found', 'EVENT_NOT_FOUND'));
+      return;
+    }
+
+    // Check if event is active and public
+    if (!event.isActive || !event.isPublic) {
+      res.status(403).json(errorResponse('Event not available for booking', 'EVENT_NOT_AVAILABLE'));
+      return;
+    }
+
+    // Calculate total amount
+    const count = attendeesCount || 1;
+    const totalAmount = event.pricePerStudent * count;
+
+    // Check if there's space available
+    const existingBookings = await BookingModel.find({
+      eventId,
+      eventDate: new Date(eventDate),
+      status: { $ne: 'cancelled' }
+    });
+
+    const totalAttendees = existingBookings.reduce((sum, booking) => sum + booking.attendeesCount, 0);
+    if (totalAttendees + count > event.maxCapacity) {
+      res.status(400).json(errorResponse('Not enough spots available', 'CAPACITY_EXCEEDED'));
+      return;
+    }
+
+    // Create new booking
+    const newBooking = new BookingModel({
+      userId: req.user.uid,
+      eventId,
+      eventDate: new Date(eventDate),
+      status: 'pending',
+      paymentStatus: 'unpaid',
+      attendeesCount: count,
+      totalAmount,
+      specialRequirements
+    });
+
+    await newBooking.save();
+
+    // Initiate payment process
+    try {
+      const paymentResponse = await axios.post(`${process.env.PAYMENT_SERVICE_URL}/api/payments/initiate`, {
+        bookingId: newBooking._id,
+        amount: totalAmount,
+        currency: event.currency,
+        description: `Booking for ${event.title}`,
+        metadata: {
+          eventId: event._id,
+          eventTitle: event.title,
+          bookingId: newBooking._id
+        }
+      });
+
+      // Update booking with payment ID
+      if (paymentResponse.data.success) {
+        newBooking.paymentId = paymentResponse.data.data.paymentId;
+        await newBooking.save();
+      }
+
+      res.status(201).json(successResponse({
+        booking: newBooking,
+        payment: paymentResponse.data.data
+      }));
+    } catch (paymentError) {
+      console.error('Payment initiation error:', paymentError);
+      // Still create the booking, but note that payment failed to initialize
+      res.status(201).json(successResponse({
+        booking: newBooking,
+        paymentError: 'Failed to initialize payment. Please try paying later.'
+      }));
+    }
+  } catch (error: any) {
+    console.error('Create booking error:', error);
+    res.status(500).json(errorResponse(error.message, 'BOOKING_CREATE_ERROR'));
+  }
+};
+
+/**
+ * Get booking by ID
+ */
+export const getBookingById = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    const { id } = req.params;
+    const booking = await BookingModel.findById(id);
+
+    if (!booking) {
+      res.status(404).json(errorResponse('Booking not found', 'BOOKING_NOT_FOUND'));
+      return;
+    }
+
+    // Check if user is authorized to view this booking
+    // Either the booker or the event creator/collaborator can view
+    const event = await EventModel.findById(booking.eventId);
+
+    if (booking.userId !== req.user.uid && 
+        event?.leadCreatorId !== req.user.uid && 
+        !event?.collaborators.some(collab => collab.creatorId === req.user?.uid)) {
+      res.status(403).json(errorResponse('Not authorized to view this booking', 'NOT_AUTHORIZED'));
+      return;
+    }
+
+    res.status(200).json(successResponse(booking));
+  } catch (error: any) {
+    console.error('Get booking error:', error);
+    res.status(500).json(errorResponse(error.message, 'BOOKING_FETCH_ERROR'));
+  }
+};
+
+/**
+ * Update booking status
+ */
+export const updateBookingStatus = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (!status || !['confirmed', 'cancelled'].includes(status)) {
+      res.status(400).json(errorResponse('Invalid status', 'INVALID_STATUS'));
+      return;
+    }
+
+    const booking = await BookingModel.findById(id);
+
+    if (!booking) {
+      res.status(404).json(errorResponse('Booking not found', 'BOOKING_NOT_FOUND'));
+      return;
+    }
+
+    // Check if user is authorized to update this booking
+    const event = await EventModel.findById(booking.eventId);
+
+    const isCreator = event?.leadCreatorId === req.user.uid || 
+                      event?.collaborators.some(collab => collab.creatorId === req.user?.uid);
+    const isBooker = booking.userId === req.user.uid;
+
+    // Only the creator can confirm, and either creator or booker can cancel
+    if ((status === 'confirmed' && !isCreator) || 
+        (status === 'cancelled' && !isCreator && !isBooker)) {
+      res.status(403).json(errorResponse('Not authorized to update this booking', 'NOT_AUTHORIZED'));
+      return;
+    }
+
+    // Handle cancellation payment refund logic through payment service
+    if (status === 'cancelled' && booking.paymentStatus === 'paid') {
+      try {
+        await axios.post(`${process.env.PAYMENT_SERVICE_URL}/api/payments/refund`, {
+          bookingId: booking._id
+        });
+        
+        // Payment service will update the payment status asynchronously
+      } catch (refundError) {
+        console.error('Refund error:', refundError);
+        // Continue with cancellation but note the refund issue
+      }
+    }
+
+    booking.status = status;
+    await booking.save();
+
+    res.status(200).json(successResponse(booking));
+  } catch (error: any) {
+    console.error('Update booking status error:', error);
+    res.status(500).json(errorResponse(error.message, 'BOOKING_UPDATE_ERROR'));
+  }
+};
+
+/**
+ * List user's bookings
+ */
+export const getUserBookings = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    const { status, fromDate, toDate, page = 1, limit = 10 } = req.query;
+
+    // Build query
+    const query: any = { userId: req.user.uid };
+
+    if (status) {
+      query.status = status;
+    }
+
+    if (fromDate) {
+      query.eventDate = { $gte: new Date(fromDate as string) };
+    }
+
+    if (toDate) {
+      if (!query.eventDate) {
+        query.eventDate = {};
+      }
+      query.eventDate.$lte = new Date(toDate as string);
+    }
+
+    // Calculate pagination
+    const skip = (Number(page) - 1) * Number(limit);
+
+    // Execute query
+    const bookings = await BookingModel.find(query)
+      .sort({ eventDate: 1 })
+      .skip(skip)
+      .limit(Number(limit));
+
+    // Get total count for pagination
+    const total = await BookingModel.countDocuments(query);
+
+    res.status(200).json(successResponse({
+      bookings,
+      pagination: {
+        total,
+        page: Number(page),
+        limit: Number(limit),
+        pages: Math.ceil(total / Number(limit))
+      }
+    }));
+  } catch (error: any) {
+    console.error('Get user bookings error:', error);
+    res.status(500).json(errorResponse(error.message, 'BOOKINGS_FETCH_ERROR'));
+  }
+};
+
+/**
+ * List bookings for an event (only for event creator/collaborator)
+ */
+export const getEventBookings = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    const { eventId } = req.params;
+    const { status, page = 1, limit = 10 } = req.query;
+
+    // Check if user is authorized to view these bookings
+    const event = await EventModel.findById(eventId);
+
+    if (!event) {
+      res.status(404).json(errorResponse('Event not found', 'EVENT_NOT_FOUND'));
+      return;
+    }
+
+    if (event.leadCreatorId !== req.user.uid && 
+        !event.collaborators.some(collab => collab.creatorId === req.user?.uid)) {
+      res.status(403).json(errorResponse('Not authorized to view bookings for this event', 'NOT_AUTHORIZED'));
+      return;
+    }
+
+    // Build query
+    const query: any = { eventId };
+
+    if (status) {
+      query.status = status;
+    }
+
+    // Calculate pagination
+    const skip = (Number(page) - 1) * Number(limit);
+
+    // Execute query
+    const bookings = await BookingModel.find(query)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(Number(limit));
+
+    // Get total count for pagination
+    const total = await BookingModel.countDocuments(query);
+
+    res.status(200).json(successResponse({
+      bookings,
+      pagination: {
+        total,
+        page: Number(page),
+        limit: Number(limit),
+        pages: Math.ceil(total / Number(limit))
+      }
+    }));
+  } catch (error: any) {
+    console.error('Get event bookings error:', error);
+    res.status(500).json(errorResponse(error.message, 'BOOKINGS_FETCH_ERROR'));
+  }
+};

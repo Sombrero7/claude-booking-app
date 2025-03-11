@@ -1,6 +1,6 @@
 module.exports = {
-    extends: ["./base.js"],
-    env: {
-      node: true
-    }
-  };
+  extends: ["./base.js"],
+  env: {
+    node: true
+  }
+};

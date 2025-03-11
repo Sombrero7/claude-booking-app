@@ -1,0 +1,151 @@
+import { Request, Response } from 'express';
+import { TransactionModel, BookingModel, RequestModel } from '@booking-platform/database';
+import Stripe from 'stripe';
+
+// Initialize Stripe with the secret key
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY as string, {
+  apiVersion: '2023-08-16'
+});
+
+/**
+ * Handle Stripe webhooks
+ */
+export const handleStripeWebhook = async (req: Request, res: Response): Promise<void> => {
+  const signature = req.headers['stripe-signature'] as string;
+
+  if (!signature) {
+    res.status(400).send('Webhook Error: No signature provided');
+    return;
+  }
+
+  let event: Stripe.Event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      signature,
+      process.env.STRIPE_WEBHOOK_SECRET as string
+    );
+  } catch (err: any) {
+    console.error(`Webhook signature verification failed: ${err.message}`);
+    res.status(400).send(`Webhook Error: ${err.message}`);
+    return;
+  }
+
+  // Handle the event
+  switch (event.type) {
+    case 'payment_intent.succeeded':
+      await handlePaymentIntentSucceeded(event.data.object as Stripe.PaymentIntent);
+      break;
+    case 'payment_intent.payment_failed':
+      await handlePaymentIntentFailed(event.data.object as Stripe.PaymentIntent);
+      break;
+    // Add more event handlers as needed
+    default:
+      console.log(`Unhandled event type: ${event.type}`);
+  }
+
+  // Return a 200 response to acknowledge receipt of the event
+  res.status(200).json({ received: true });
+};
+
+/**
+ * Handle payment intent succeeded event
+ */
+const handlePaymentIntentSucceeded = async (paymentIntent: Stripe.PaymentIntent): Promise<void> => {
+  try {
+    const transactionId = paymentIntent.metadata.transactionId;
+    
+    if (!transactionId) {
+      console.error('No transaction ID in payment intent metadata');
+      return;
+    }
+
+    // Update transaction status
+    const transaction = await TransactionModel.findById(transactionId);
+    
+    if (!transaction) {
+      console.error(`Transaction not found for ID: ${transactionId}`);
+      return;
+    }
+
+    transaction.status = 'completed';
+    transaction.paymentMethodDetails = {
+      paymentIntentId: paymentIntent.id,
+      amount: paymentIntent.amount,
+      capturedAt: new Date()
+    };
+    
+    await transaction.save();
+
+    // Update booking or request status
+    if (transaction.bookingId) {
+      await BookingModel.findByIdAndUpdate(transaction.bookingId, {
+        paymentStatus: 'paid',
+        status: 'confirmed'
+      });
+      
+      // Notify booking service
+      try {
+        await axios.post(`${process.env.BOOKING_SERVICE_URL}/api/bookings/${transaction.bookingId}/payment-confirmation`, {
+          paymentId: transaction._id
+        });
+      } catch (notifyError) {
+        console.error('Error notifying booking service:', notifyError);
+      }
+    } else if (transaction.requestId) {
+      await RequestModel.findByIdAndUpdate(transaction.requestId, {
+        paymentStatus: 'paid'
+      });
+      
+      // Notify booking service
+      try {
+        await axios.post(`${process.env.BOOKING_SERVICE_URL}/api/requests/${transaction.requestId}/payment-confirmation`, {
+          paymentId: transaction._id
+        });
+      } catch (notifyError) {
+        console.error('Error notifying booking service:', notifyError);
+      }
+    }
+
+    console.log(`Payment successful for transaction: ${transactionId}`);
+  } catch (error) {
+    console.error('Error handling payment_intent.succeeded event:', error);
+  }
+};
+
+/**
+ * Handle payment intent failed event
+ */
+const handlePaymentIntentFailed = async (paymentIntent: Stripe.PaymentIntent): Promise<void> => {
+  try {
+    const transactionId = paymentIntent.metadata.transactionId;
+    
+    if (!transactionId) {
+      console.error('No transaction ID in payment intent metadata');
+      return;
+    }
+
+    // Update transaction status
+    const transaction = await TransactionModel.findById(transactionId);
+    
+    if (!transaction) {
+      console.error(`Transaction not found for ID: ${transactionId}`);
+      return;
+    }
+
+    transaction.status = 'failed';
+    transaction.paymentMethodDetails = {
+      paymentIntentId: paymentIntent.id,
+      amount: paymentIntent.amount,
+      failedAt: new Date(),
+      failureMessage: paymentIntent.last_payment_error?.message
+    };
+    
+    await transaction.save();
+
+    console.log(`Payment failed for transaction: ${transactionId}`);
+  } catch (error) {
+    console.error('Error handling payment_intent.payment_failed event:', error);
+  }
+};

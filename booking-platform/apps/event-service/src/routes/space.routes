@@ -1,0 +1,15 @@
+import { Router } from 'express';
+import * as SpaceController from '../controllers/space.controller';
+
+const router = Router();
+
+// Space endpoints
+router.post('/spaces', SpaceController.createSpace);
+router.get('/spaces', SpaceController.listSpaces);
+router.get('/spaces/me', SpaceController.getMySpaces);
+router.get('/spaces/:id', SpaceController.getSpaceById);
+router.put('/spaces/:id', SpaceController.updateSpace);
+router.delete('/spaces/:id', SpaceController.deleteSpace);
+router.get('/spaces/:id/availability', SpaceController.checkSpaceAvailability);
+
+export default router;

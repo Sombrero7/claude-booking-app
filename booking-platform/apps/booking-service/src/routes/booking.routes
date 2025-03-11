@@ -1,0 +1,13 @@
+import { Router } from 'express';
+import * as BookingController from '../controllers/booking.controller';
+
+const router = Router();
+
+// Booking endpoints
+router.post('/bookings', BookingController.createBooking);
+router.get('/bookings/me', BookingController.getUserBookings);
+router.get('/bookings/:id', BookingController.getBookingById);
+router.put('/bookings/:id/status', BookingController.updateBookingStatus);
+router.get('/events/:eventId/bookings', BookingController.getEventBookings);
+
+export default router;

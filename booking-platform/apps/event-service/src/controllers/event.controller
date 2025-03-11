@@ -1,0 +1,412 @@
+import { Request, Response } from 'express';
+import { EventModel, UserModel } from '@booking-platform/database';
+import { successResponse, errorResponse, generateOccurrences } from '@booking-platform/utils';
+import admin from 'firebase-admin';
+
+// Initialize Firebase Admin SDK
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL
+    })
+  });
+}
+
+export interface AuthRequest extends Request {
+  user?: admin.auth.DecodedIdToken;
+}
+
+/**
+ * Create a new event
+ */
+export const createEvent = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    // Get user to check if they exist and are a provider
+    const user = await UserModel.findOne({ firebaseId: req.user.uid });
+    if (!user) {
+      res.status(404).json(errorResponse('User not found', 'USER_NOT_FOUND'));
+      return;
+    }
+
+    if (user.role !== 'provider' && user.role !== 'admin') {
+      res.status(403).json(errorResponse('Only providers can create events', 'PROVIDER_ROLE_REQUIRED'));
+      return;
+    }
+
+    // Extract event data from request
+    const {
+      title,
+      description,
+      collaborators,
+      eventType,
+      schedule,
+      spaceId,
+      pricePerStudent,
+      currency,
+      maxCapacity,
+      isPublic,
+      tags
+    } = req.body;
+
+    // Validate required fields
+    if (!title || !description || !schedule || !spaceId || pricePerStudent === undefined || !maxCapacity) {
+      res.status(400).json(errorResponse('Missing required fields', 'MISSING_FIELDS'));
+      return;
+    }
+
+    // Create new event
+    const newEvent = new EventModel({
+      title,
+      description,
+      leadCreatorId: req.user.uid,
+      collaborators: collaborators || [],
+      eventType: eventType || 'single',
+      schedule,
+      spaceId,
+      pricePerStudent,
+      currency: currency || 'USD',
+      maxCapacity,
+      attendees: [],
+      isPublic: isPublic !== undefined ? isPublic : true,
+      isActive: true,
+      tags: tags || []
+    });
+
+    await newEvent.save();
+    res.status(201).json(successResponse(newEvent));
+  } catch (error: any) {
+    console.error('Create event error:', error);
+    res.status(500).json(errorResponse(error.message, 'EVENT_CREATE_ERROR'));
+  }
+};
+
+/**
+ * Get event by ID
+ */
+export const getEventById = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const event = await EventModel.findById(id);
+
+    if (!event) {
+      res.status(404).json(errorResponse('Event not found', 'EVENT_NOT_FOUND'));
+      return;
+    }
+
+    if (!event.isActive || !event.isPublic) {
+      // Check if user is authorized to view this event
+      // This would need to be enhanced with actual auth logic
+      res.status(403).json(errorResponse('Event not available', 'EVENT_NOT_AVAILABLE'));
+      return;
+    }
+
+    res.status(200).json(successResponse(event));
+  } catch (error: any) {
+    console.error('Get event error:', error);
+    res.status(500).json(errorResponse(error.message, 'EVENT_FETCH_ERROR'));
+  }
+};
+
+/**
+ * Update event details
+ */
+export const updateEvent = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    const { id } = req.params;
+    const event = await EventModel.findById(id);
+
+    if (!event) {
+      res.status(404).json(errorResponse('Event not found', 'EVENT_NOT_FOUND'));
+      return;
+    }
+
+    // Check if user is authorized to update this event
+    if (event.leadCreatorId !== req.user.uid) {
+      const isCollaborator = event.collaborators.some(
+        collab => collab.creatorId === req.user?.uid
+      );
+
+      if (!isCollaborator) {
+        res.status(403).json(errorResponse('Not authorized to update this event', 'NOT_AUTHORIZED'));
+        return;
+      }
+    }
+
+    // Update fields that are provided in the request
+    const updateData = req.body;
+    Object.keys(updateData).forEach(key => {
+      if (key !== 'leadCreatorId' && key !== '_id') {
+        // @ts-ignore
+        event[key] = updateData[key];
+      }
+    });
+
+    await event.save();
+    res.status(200).json(successResponse(event));
+  } catch (error: any) {
+    console.error('Update event error:', error);
+    res.status(500).json(errorResponse(error.message, 'EVENT_UPDATE_ERROR'));
+  }
+};
+
+/**
+ * Delete/deactivate an event
+ */
+export const deleteEvent = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    const { id } = req.params;
+    const event = await EventModel.findById(id);
+
+    if (!event) {
+      res.status(404).json(errorResponse('Event not found', 'EVENT_NOT_FOUND'));
+      return;
+    }
+
+    // Check if user is authorized to delete this event
+    if (event.leadCreatorId !== req.user.uid) {
+      res.status(403).json(errorResponse('Not authorized to delete this event', 'NOT_AUTHORIZED'));
+      return;
+    }
+
+    // Soft delete by marking as inactive
+    event.isActive = false;
+    await event.save();
+
+    res.status(200).json(successResponse({ message: 'Event deleted successfully' }));
+  } catch (error: any) {
+    console.error('Delete event error:', error);
+    res.status(500).json(errorResponse(error.message, 'EVENT_DELETE_ERROR'));
+  }
+};
+
+/**
+ * List all public events with optional filtering
+ */
+export const listEvents = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { 
+      creatorId, 
+      spaceId, 
+      fromDate, 
+      toDate, 
+      tags,
+      page = 1,
+      limit = 10
+    } = req.query;
+
+    // Build query
+    const query: any = { isActive: true, isPublic: true };
+
+    if (creatorId) {
+      query.$or = [
+        { leadCreatorId: creatorId },
+        { 'collaborators.creatorId': creatorId }
+      ];
+    }
+
+    if (spaceId) {
+      query.spaceId = spaceId;
+    }
+
+    if (fromDate) {
+      query['schedule.startDate'] = { $gte: new Date(fromDate as string) };
+    }
+
+    if (toDate) {
+      query['schedule.endDate'] = { $lte: new Date(toDate as string) };
+    }
+
+    if (tags) {
+      const tagArray = Array.isArray(tags) ? tags : [tags];
+      query.tags = { $in: tagArray };
+    }
+
+    // Calculate pagination
+    const skip = (Number(page) - 1) * Number(limit);
+
+    // Execute query
+    const events = await EventModel.find(query)
+      .sort({ 'schedule.startDate': 1 })
+      .skip(skip)
+      .limit(Number(limit));
+
+    // Get total count for pagination
+    const total = await EventModel.countDocuments(query);
+
+    res.status(200).json(successResponse({
+      events,
+      pagination: {
+        total,
+        page: Number(page),
+        limit: Number(limit),
+        pages: Math.ceil(total / Number(limit))
+      }
+    }));
+  } catch (error: any) {
+    console.error('List events error:', error);
+    res.status(500).json(errorResponse(error.message, 'EVENTS_FETCH_ERROR'));
+  }
+};
+
+/**
+ * Get events created by the current user
+ */
+export const getMyEvents = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    const events = await EventModel.find({
+      $or: [
+        { leadCreatorId: req.user.uid },
+        { 'collaborators.creatorId': req.user.uid }
+      ]
+    }).sort({ 'schedule.startDate': 1 });
+
+    res.status(200).json(successResponse(events));
+  } catch (error: any) {
+    console.error('Get my events error:', error);
+    res.status(500).json(errorResponse(error.message, 'EVENTS_FETCH_ERROR'));
+  }
+};
+
+/**
+ * Get event occurrences (for recurring events)
+ */
+export const getEventOccurrences = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const event = await EventModel.findById(id);
+
+    if (!event) {
+      res.status(404).json(errorResponse('Event not found', 'EVENT_NOT_FOUND'));
+      return;
+    }
+
+    if (event.eventType !== 'recurring') {
+      res.status(400).json(errorResponse('Not a recurring event', 'NOT_RECURRING_EVENT'));
+      return;
+    }
+
+    const occurrences = generateOccurrences(event.schedule);
+    res.status(200).json(successResponse(occurrences));
+  } catch (error: any) {
+    console.error('Get event occurrences error:', error);
+    res.status(500).json(errorResponse(error.message, 'OCCURRENCES_FETCH_ERROR'));
+  }
+};
+
+/**
+ * Add a collaborator to an event
+ */
+export const addCollaborator = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    const { id } = req.params;
+    const { creatorId, role, paymentType, paymentValue } = req.body;
+
+    const event = await EventModel.findById(id);
+
+    if (!event) {
+      res.status(404).json(errorResponse('Event not found', 'EVENT_NOT_FOUND'));
+      return;
+    }
+
+    // Check if user is authorized to update this event
+    if (event.leadCreatorId !== req.user.uid) {
+      res.status(403).json(errorResponse('Not authorized to update this event', 'NOT_AUTHORIZED'));
+      return;
+    }
+
+    // Check if collaborator already exists
+    const existingCollaborator = event.collaborators.find(
+      collab => collab.creatorId === creatorId
+    );
+
+    if (existingCollaborator) {
+      res.status(409).json(errorResponse('Collaborator already exists', 'COLLABORATOR_EXISTS'));
+      return;
+    }
+
+    // Check if collaborator exists as a user
+    const collaborator = await UserModel.findOne({ firebaseId: creatorId });
+    if (!collaborator) {
+      res.status(404).json(errorResponse('Collaborator user not found', 'USER_NOT_FOUND'));
+      return;
+    }
+
+    // Add collaborator
+    event.collaborators.push({
+      creatorId,
+      role: role || 'co-host',
+      paymentType,
+      paymentValue
+    });
+
+    await event.save();
+    res.status(200).json(successResponse(event));
+  } catch (error: any) {
+    console.error('Add collaborator error:', error);
+    res.status(500).json(errorResponse(error.message, 'COLLABORATOR_ADD_ERROR'));
+  }
+};
+
+/**
+ * Remove a collaborator from an event
+ */
+export const removeCollaborator = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    const { id, collaboratorId } = req.params;
+    const event = await EventModel.findById(id);
+
+    if (!event) {
+      res.status(404).json(errorResponse('Event not found', 'EVENT_NOT_FOUND'));
+      return;
+    }
+
+    // Check if user is authorized to update this event
+    if (event.leadCreatorId !== req.user.uid) {
+      res.status(403).json(errorResponse('Not authorized to update this event', 'NOT_AUTHORIZED'));
+      return;
+    }
+
+    // Remove the collaborator
+    event.collaborators = event.collaborators.filter(
+      collab => collab.creatorId !== collaboratorId
+    );
+
+    await event.save();
+    res.status(200).json(successResponse(event));
+  } catch (error: any) {
+    console.error('Remove collaborator error:', error);
+    res.status(500).json(errorResponse(error.message, 'COLLABORATOR_REMOVE_ERROR'));
+  }
+};

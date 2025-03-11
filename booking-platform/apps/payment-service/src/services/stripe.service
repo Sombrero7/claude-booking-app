@@ -1,0 +1,183 @@
+import Stripe from 'stripe';
+import { calculateCollaboratorSplits } from '@booking-platform/utils';
+import { UserModel, EventModel, TransactionModel } from '@booking-platform/database';
+
+// Initialize Stripe client
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY as string, {
+  apiVersion: '2023-08-16'
+});
+
+/**
+ * Create a Stripe customer
+ */
+export const createStripeCustomer = async (userId: string, email: string, name: string): Promise<string> => {
+  try {
+    const customer = await stripe.customers.create({
+      email,
+      name,
+      metadata: {
+        userId
+      }
+    });
+
+    return customer.id;
+  } catch (error) {
+    console.error('Create Stripe customer error:', error);
+    throw error;
+  }
+};
+
+/**
+ * Create a Stripe connected account for creators
+ */
+export const createStripeConnectedAccount = async (userId: string, email: string): Promise<string> => {
+  try {
+    const account = await stripe.accounts.create({
+      type: 'express',
+      email,
+      metadata: {
+        userId
+      },
+      capabilities: {
+        card_payments: { requested: true },
+        transfers: { requested: true }
+      }
+    });
+
+    return account.id;
+  } catch (error) {
+    console.error('Create Stripe connected account error:', error);
+    throw error;
+  }
+};
+
+/**
+ * Create account link for onboarding
+ */
+export const createAccountLink = async (accountId: string, refreshUrl: string, returnUrl: string): Promise<string> => {
+  try {
+    const accountLink = await stripe.accountLinks.create({
+      account: accountId,
+      refresh_url: refreshUrl,
+      return_url: returnUrl,
+      type: 'account_onboarding'
+    });
+
+    return accountLink.url;
+  } catch (error) {
+    console.error('Create account link error:', error);
+    throw error;
+  }
+};
+
+/**
+ * Create a payment intent
+ */
+export const createPaymentIntent = async (
+  amount: number,
+  currency: string,
+  customerId: string,
+  metadata: any
+): Promise<Stripe.PaymentIntent> => {
+  try {
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: Math.round(amount * 100), // Convert to cents
+      currency: currency.toLowerCase(),
+      customer: customerId,
+      metadata,
+      payment_method_types: ['card']
+    });
+
+    return paymentIntent;
+  } catch (error) {
+    console.error('Create payment intent error:', error);
+    throw error;
+  }
+};
+
+/**
+ * Handle payment for booking with collaborator splits
+ */
+export const handleBookingPayment = async (bookingId: string, eventId: string, amount: number, currency: string): Promise<any> => {
+  try {
+    // Get event details to calculate splits
+    const event = await EventModel.findById(eventId);
+    if (!event) {
+      throw new Error('Event not found');
+    }
+
+    // Get lead creator's Stripe account
+    const leadCreator = await UserModel.findOne({ firebaseId: event.leadCreatorId });
+    if (!leadCreator || !leadCreator.stripe?.accountId) {
+      throw new Error('Lead creator not found or Stripe account not set up');
+    }
+
+    // Calculate collaborator splits
+    let collaboratorSplits: Array<{ creatorId: string; amount: number }> = [];
+    let leadCreatorShare = amount;
+    
+    if (event.collaborators && event.collaborators.length > 0) {
+      collaboratorSplits = calculateCollaboratorSplits(
+        amount,
+        event.collaborators
+      );
+      
+      // Subtract collaborator amounts from lead creator share
+      leadCreatorShare = amount - collaboratorSplits.reduce((sum, split) => sum + split.amount, 0);
+    }
+
+    // Store transaction record
+    const transaction = new TransactionModel({
+      bookingId,
+      transactionType: 'booking',
+      amount,
+      currency,
+      paymentMethod: 'stripe',
+      collaboratorSplits,
+      platformFee: 0, // Calculated elsewhere
+      status: 'pending'
+    });
+    
+    await transaction.save();
+
+    // Get collaborator Stripe accounts
+    const collaboratorPayments = [];
+    
+    for (const split of collaboratorSplits) {
+      const collaborator = await UserModel.findOne({ firebaseId: split.creatorId });
+      if (collaborator && collaborator.stripe?.accountId) {
+        collaboratorPayments.push({
+          creatorId: split.creatorId,
+          stripeAccountId: collaborator.stripe.accountId,
+          amount: split.amount
+        });
+      }
+    }
+
+    return {
+      transactionId: transaction._id,
+      leadCreatorShare,
+      leadCreatorStripeAccount: leadCreator.stripe.accountId,
+      collaboratorPayments
+    };
+  } catch (error) {
+    console.error('Handle booking payment error:', error);
+    throw error;
+  }
+};
+
+/**
+ * Process refund
+ */
+export const processRefund = async (paymentIntentId: string): Promise<Stripe.Refund> => {
+  try {
+    const refund = await stripe.refunds.create({
+      payment_intent: paymentIntentId
+    });
+
+    return refund;
+  } catch (error) {
+    console.error('Process refund error:', error);
+    throw error;
+  }
+};
