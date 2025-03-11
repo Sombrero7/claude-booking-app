@@ -1,0 +1,11 @@
+{
+  "name": "@booking-platform/typescript-config",
+  "version": "0.0.1",
+  "private": true,
+  "files": [
+    "base.json",
+    "nextjs.json",
+    "node.json",
+    "react.json"
+  ]
+}

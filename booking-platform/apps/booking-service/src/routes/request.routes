@@ -1,0 +1,14 @@
+import { Router } from 'express';
+import * as RequestController from '../controllers/request.controller';
+
+const router = Router();
+
+// Request endpoints
+router.post('/requests', RequestController.createRequest);
+router.get('/requests/me', RequestController.getUserRequests);
+router.get('/requests/creator', RequestController.getCreatorRequests);
+router.get('/requests/venue', RequestController.getVenueRequests);
+router.get('/requests/:id', RequestController.getRequestById);
+router.put('/requests/:id/approval', RequestController.updateRequestApproval);
+
+export default router;

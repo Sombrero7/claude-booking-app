@@ -1,0 +1,323 @@
+import { Request, Response } from 'express';
+import { SpaceModel, UserModel } from '@booking-platform/database';
+import { successResponse, errorResponse } from '@booking-platform/utils';
+import admin from 'firebase-admin';
+
+export interface AuthRequest extends Request {
+  user?: admin.auth.DecodedIdToken;
+}
+
+/**
+ * Create a new space
+ */
+export const createSpace = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    // Get user to check if they exist and are a provider
+    const user = await UserModel.findOne({ firebaseId: req.user.uid });
+    if (!user) {
+      res.status(404).json(errorResponse('User not found', 'USER_NOT_FOUND'));
+      return;
+    }
+
+    if (user.role !== 'provider' && user.role !== 'admin') {
+      res.status(403).json(errorResponse('Only providers can create spaces', 'PROVIDER_ROLE_REQUIRED'));
+      return;
+    }
+
+    // Extract space data from request
+    const {
+      title,
+      description,
+      location,
+      capacity,
+      amenities,
+      pricing,
+      availability,
+      photos
+    } = req.body;
+
+    // Validate required fields
+    if (!title || !description || !location || !capacity || !pricing || !availability) {
+      res.status(400).json(errorResponse('Missing required fields', 'MISSING_FIELDS'));
+      return;
+    }
+
+    // Create new space
+    const newSpace = new SpaceModel({
+      ownerId: req.user.uid,
+      title,
+      description,
+      location,
+      capacity,
+      amenities: amenities || [],
+      pricing,
+      availability,
+      photos: photos || [],
+      isActive: true
+    });
+
+    await newSpace.save();
+    res.status(201).json(successResponse(newSpace));
+  } catch (error: any) {
+    console.error('Create space error:', error);
+    res.status(500).json(errorResponse(error.message, 'SPACE_CREATE_ERROR'));
+  }
+};
+
+/**
+ * Get space by ID
+ */
+export const getSpaceById = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const space = await SpaceModel.findById(id);
+
+    if (!space) {
+      res.status(404).json(errorResponse('Space not found', 'SPACE_NOT_FOUND'));
+      return;
+    }
+
+    if (!space.isActive) {
+      res.status(403).json(errorResponse('Space not available', 'SPACE_NOT_AVAILABLE'));
+      return;
+    }
+
+    res.status(200).json(successResponse(space));
+  } catch (error: any) {
+    console.error('Get space error:', error);
+    res.status(500).json(errorResponse(error.message, 'SPACE_FETCH_ERROR'));
+  }
+};
+
+/**
+ * Update space details
+ */
+export const updateSpace = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    const { id } = req.params;
+    const space = await SpaceModel.findById(id);
+
+    if (!space) {
+      res.status(404).json(errorResponse('Space not found', 'SPACE_NOT_FOUND'));
+      return;
+    }
+
+    // Check if user is authorized to update this space
+    if (space.ownerId !== req.user.uid) {
+      res.status(403).json(errorResponse('Not authorized to update this space', 'NOT_AUTHORIZED'));
+      return;
+    }
+
+    // Update fields that are provided in the request
+    const updateData = req.body;
+    Object.keys(updateData).forEach(key => {
+      if (key !== 'ownerId' && key !== '_id') {
+        // @ts-ignore
+        space[key] = updateData[key];
+      }
+    });
+
+    await space.save();
+    res.status(200).json(successResponse(space));
+  } catch (error: any) {
+    console.error('Update space error:', error);
+    res.status(500).json(errorResponse(error.message, 'SPACE_UPDATE_ERROR'));
+  }
+};
+
+/**
+ * Delete/deactivate a space
+ */
+export const deleteSpace = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    const { id } = req.params;
+    const space = await SpaceModel.findById(id);
+
+    if (!space) {
+      res.status(404).json(errorResponse('Space not found', 'SPACE_NOT_FOUND'));
+      return;
+    }
+
+    // Check if user is authorized to delete this space
+    if (space.ownerId !== req.user.uid) {
+      res.status(403).json(errorResponse('Not authorized to delete this space', 'NOT_AUTHORIZED'));
+      return;
+    }
+
+    // Soft delete by marking as inactive
+    space.isActive = false;
+    await space.save();
+
+    res.status(200).json(successResponse({ message: 'Space deleted successfully' }));
+  } catch (error: any) {
+    console.error('Delete space error:', error);
+    res.status(500).json(errorResponse(error.message, 'SPACE_DELETE_ERROR'));
+  }
+};
+
+/**
+ * List all active spaces with optional filtering
+ */
+export const listSpaces = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { 
+      ownerId, 
+      city, 
+      capacity, 
+      amenities,
+      minPrice,
+      maxPrice,
+      page = 1,
+      limit = 10
+    } = req.query;
+
+    // Build query
+    const query: any = { isActive: true };
+
+    if (ownerId) {
+      query.ownerId = ownerId;
+    }
+
+    if (city) {
+      query['location.city'] = city;
+    }
+
+    if (capacity) {
+      query.capacity = { $gte: Number(capacity) };
+    }
+
+    if (amenities) {
+      const amenitiesArray = Array.isArray(amenities) ? amenities : [amenities];
+      query.amenities = { $all: amenitiesArray };
+    }
+
+    if (minPrice) {
+      query['pricing.hourlyRate'] = { $gte: Number(minPrice) };
+    }
+
+    if (maxPrice) {
+      if (!query['pricing.hourlyRate']) {
+        query['pricing.hourlyRate'] = {};
+      }
+      query['pricing.hourlyRate'].$lte = Number(maxPrice);
+    }
+
+    // Calculate pagination
+    const skip = (Number(page) - 1) * Number(limit);
+
+    // Execute query
+    const spaces = await SpaceModel.find(query)
+      .sort({ 'pricing.hourlyRate': 1 })
+      .skip(skip)
+      .limit(Number(limit));
+
+    // Get total count for pagination
+    const total = await SpaceModel.countDocuments(query);
+
+    res.status(200).json(successResponse({
+      spaces,
+      pagination: {
+        total,
+        page: Number(page),
+        limit: Number(limit),
+        pages: Math.ceil(total / Number(limit))
+      }
+    }));
+  } catch (error: any) {
+    console.error('List spaces error:', error);
+    res.status(500).json(errorResponse(error.message, 'SPACES_FETCH_ERROR'));
+  }
+};
+
+/**
+ * Get spaces owned by the current user
+ */
+export const getMySpaces = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json(errorResponse('User not authenticated', 'AUTH_REQUIRED'));
+      return;
+    }
+
+    const spaces = await SpaceModel.find({ ownerId: req.user.uid });
+    res.status(200).json(successResponse(spaces));
+  } catch (error: any) {
+    console.error('Get my spaces error:', error);
+    res.status(500).json(errorResponse(error.message, 'SPACES_FETCH_ERROR'));
+  }
+};
+
+/**
+ * Check space availability for a specific time range
+ */
+export const checkSpaceAvailability = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const { date, startTime, endTime } = req.query;
+
+    if (!date || !startTime || !endTime) {
+      res.status(400).json(errorResponse('Missing required parameters', 'MISSING_PARAMS'));
+      return;
+    }
+
+    const space = await SpaceModel.findById(id);
+
+    if (!space || !space.isActive) {
+      res.status(404).json(errorResponse('Space not found or not available', 'SPACE_UNAVAILABLE'));
+      return;
+    }
+
+    // Check if the requested date falls on a day when the space is available
+    const requestDate = new Date(date as string);
+    const dayOfWeek = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][requestDate.getDay()];
+    
+    // Find availability for the requested day of week
+    const dayAvailability = space.availability.find(
+      avail => avail.dayOfWeek === dayOfWeek
+    );
+
+    if (!dayAvailability) {
+      res.status(200).json(successResponse({ available: false, reason: 'Space not available on this day' }));
+      return;
+    }
+
+    // Check if the requested time range falls within the available hours
+    const spaceStartTime = dayAvailability.startTime;
+    const spaceEndTime = dayAvailability.endTime;
+    
+    if (startTime < spaceStartTime || endTime > spaceEndTime) {
+      res.status(200).json(successResponse({ 
+        available: false, 
+        reason: 'Time range outside of space operating hours',
+        availableHours: {
+          start: spaceStartTime,
+          end: spaceEndTime
+        }
+      }));
+      return;
+    }
+
+    // Here we would also check for conflicting bookings in a real system
+    // This would require querying the booking service or database
+
+    res.status(200).json(successResponse({ available: true }));
+  } catch (error: any) {
+    console.error('Check availability error:', error);
+    res.status(500).json(errorResponse(error.message, 'AVAILABILITY_CHECK_ERROR'));
+  }
+};

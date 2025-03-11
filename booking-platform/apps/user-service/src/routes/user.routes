@@ -1,0 +1,18 @@
+import { Router } from 'express';
+import * as UserController from '../controllers/user.controller';
+
+const router = Router();
+
+// User profile endpoints
+router.post('/users', UserController.createUser);
+router.get('/users/me', UserController.getCurrentUser);
+router.get('/users/:id', UserController.getUserById);
+router.put('/users/me', UserController.updateUser);
+
+// Social endpoints
+router.post('/users/:userId/follow', UserController.followUser);
+router.delete('/users/:userId/follow', UserController.unfollowUser);
+router.get('/users/:userId/followers', UserController.getUserFollowers);
+router.get('/users/:userId/following', UserController.getUserFollowing);
+
+export default router;

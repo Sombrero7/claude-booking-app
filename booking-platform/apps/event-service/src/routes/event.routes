@@ -1,0 +1,19 @@
+import { Router } from 'express';
+import * as EventController from '../controllers/event.controller';
+
+const router = Router();
+
+// Event endpoints
+router.post('/events', EventController.createEvent);
+router.get('/events', EventController.listEvents);
+router.get('/events/me', EventController.getMyEvents);
+router.get('/events/:id', EventController.getEventById);
+router.put('/events/:id', EventController.updateEvent);
+router.delete('/events/:id', EventController.deleteEvent);
+router.get('/events/:id/occurrences', EventController.getEventOccurrences);
+
+// Collaborator endpoints
+router.post('/events/:id/collaborators', EventController.addCollaborator);
+router.delete('/events/:id/collaborators/:collaboratorId', EventController.removeCollaborator);
+
+export default router;

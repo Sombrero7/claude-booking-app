@@ -1,0 +1,42 @@
+import mongoose, { Document, Schema } from 'mongoose';
+
+export interface IBooking extends Document {
+  userId: string;
+  eventId: string;
+  eventDate: Date;
+  status: 'confirmed' | 'pending' | 'cancelled';
+  paymentStatus: 'unpaid' | 'partial' | 'paid';
+  paymentId: string;
+  attendeesCount: number;
+  totalAmount: number;
+  specialRequirements?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const BookingSchema = new Schema<IBooking>(
+  {
+    userId: { type: String, required: true, ref: 'User' },
+    eventId: { type: String, required: true, ref: 'Event' },
+    eventDate: { type: Date, required: true },
+    status: { 
+      type: String, 
+      required: true, 
+      enum: ['confirmed', 'pending', 'cancelled'],
+      default: 'pending'
+    },
+    paymentStatus: { 
+      type: String, 
+      required: true, 
+      enum: ['unpaid', 'partial', 'paid'],
+      default: 'unpaid'
+    },
+    paymentId: String,
+    attendeesCount: { type: Number, required: true, default: 1 },
+    totalAmount: { type: Number, required: true },
+    specialRequirements: String
+  },
+  { timestamps: true }
+);
+
+export const BookingModel = mongoose.models.Booking || mongoose.model<IBooking>('Booking', BookingSchema);

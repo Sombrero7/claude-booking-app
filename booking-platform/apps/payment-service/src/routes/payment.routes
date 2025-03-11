@@ -1,0 +1,13 @@
+import { Router } from 'express';
+import * as PaymentController from '../controllers/payment.controller';
+
+const router = Router();
+
+// Payment endpoints
+router.post('/payments/initiate', PaymentController.initiatePayment);
+router.post('/payments/confirm', PaymentController.confirmPayment);
+router.post('/payments/refund', PaymentController.processRefund);
+router.get('/payments/transactions', PaymentController.getUserTransactions);
+router.post('/payments/setup-stripe', PaymentController.setupStripeAccount);
+
+export default router;
